@@ -1,0 +1,172 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+// Unified launcher for the RadixServer.
+//
+// Single-node:
+//     radix_server --name /my_kv_cache --max-blocks 100000
+//
+// Distributed (run on each node; rank is assigned by the registry):
+//     radix_server --expected-min-nodes N --registry etcd://10.0.0.1:2379 \
+//                  --max-blocks 100000
+// The RHT is configured with RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_* (docs/api.md).
+
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <chrono>
+#include <exception>
+#include <thread>
+
+#include "radix_server.h"
+#include "radix_tree.h"
+
+static volatile sig_atomic_t g_running = 1;
+
+static void signal_handler(int) { g_running = 0; }
+
+static void print_usage(const char* prog) {
+    printf("Usage: %s [options]\n", prog);
+    printf("\nTree options:\n");
+    printf("  --name <string>          Shared memory name (default: /radixshmem)\n");
+    printf("  --max-blocks <int>       Mempool capacity in blocks (default: 0 = disabled)\n");
+    printf("  --block-size <int>       Tokens per block (default: 1)\n");
+    printf("  --max-nodes <int>        NodePool capacity (default: auto = max_blocks*min(block_size/128,1))\n");
+    printf("  --register-chunk-tokens <int> RHT registration granularity in tokens, converted to blocks with --block-size (default: 4096)\n");
+    printf("  --background-evict-ratio <float> Background evictor free-fraction target (default: 0.05, 0=disabled)\n");
+    printf("  --data-pool-ratio <float>  DataPool size = max_blocks * ratio * block_bytes (default: 4.0)\n");
+    printf("  --evict-policy <str>     Eviction policy: lru (default: lru)\n");
+    printf("\nDistributed options (expected-min-nodes > 1 enables distributed mode;\n");
+    printf("the RHT is configured with RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_*, the peer index with\n");
+    printf("RADIXSHMEM_PEER_INDEX_BACKEND=grpc|rdma and RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=xrc|dc,\n");
+    printf("and the RDMA device of either with RADIXSHMEM_INDEX_DEV / RADIXSHMEM_INDEX_GID_IDX,\n");
+    printf("see docs/api.md):\n");
+    printf("  --expected-min-nodes <int> Nodes to wait for before the cluster forms\n");
+    printf("  --rpc-address <ip>       Bootstrap IP peers connect to (required; 0.0.0.0 for single node)\n");
+    printf("  --rpc-interface <nic>    NIC name to resolve the bootstrap IP from; wins over --rpc-address\n");
+    printf("  --rpc-port <int>         gRPC port peers reach: remote ops, peer queries,\n"
+           "                           RDMA connection setup (default: 0 = OS-assigned)\n");
+    printf("  --settle-ms <int>        Membership stability window in ms (default: 500)\n");
+    printf("  --registry <string>      Cluster bootstrap registry etcd://host:port (default: etcd://127.0.0.1:2379)\n");
+    printf("  --cluster-id <string>    etcd key namespace radix/<cluster-id>/... (default: default)\n");
+    printf("  --node-name <string>     etcd node identity; empty derives from the resolved IP (default: empty)\n");
+    printf("  --bootstrap-timeout <int> Bootstrap timeout in seconds (default: 60)\n");
+    printf("  --lease-ttl <int>         etcd lease TTL in seconds (default: 30)\n");
+    printf("\n  --help                   Show this help\n");
+}
+
+int main(int argc, char** argv) {
+    radixshmem::RadixServerConfig cfg;
+    const char* evict_policy_str = "lru";
+
+    for (int i = 1; i < argc; i++) {
+        auto arg = [&](const char* flag) { return strcmp(argv[i], flag) == 0; };
+        auto next_str = [&]() -> const char* { return argv[++i]; };
+        auto next_int = [&]() { return atoi(argv[++i]); };
+        auto next_flt = [&]() { return (float)atof(argv[++i]); };
+
+        if (arg("--help") || arg("-h")) { print_usage(argv[0]); return 0; }
+        else if (arg("--name"))              cfg.name = next_str();
+        else if (arg("--max-blocks"))        cfg.shm.max_blocks = (uint32_t)next_int();
+        else if (arg("--block-size"))        cfg.shm.block_size = next_int();
+        else if (arg("--max-nodes"))         cfg.shm.max_nodes = (uint32_t)next_int();
+        else if (arg("--register-chunk-tokens")) cfg.register_chunk_tokens = next_int();
+        else if (arg("--background-evict-ratio")) cfg.shm.background_evict_ratio = next_flt();
+        else if (arg("--data-pool-ratio"))   cfg.shm.data_pool_ratio = next_flt();
+        else if (arg("--evict-policy"))      evict_policy_str = next_str();
+        else if (arg("--settle-ms"))         cfg.settle_ms = next_int();
+        else if (arg("--registry"))          cfg.registry = next_str();
+        else if (arg("--cluster-id"))        cfg.cluster_id = next_str();
+        else if (arg("--node-name"))         cfg.node_name = next_str();
+        else if (arg("--rpc-address"))       cfg.rpc_address = next_str();
+        else if (arg("--rpc-interface"))     cfg.rpc_interface = next_str();
+        else if (arg("--rpc-port"))          cfg.rpc_port = (uint16_t)next_int();
+        else if (arg("--bootstrap-timeout")) cfg.bootstrap_timeout_sec = next_int();
+        else if (arg("--lease-ttl"))         cfg.lease_ttl_sec = next_int();
+        else if (arg("--expected-min-nodes")) cfg.expected_min_nodes = next_int();
+        else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+
+    if (strcmp(evict_policy_str, "lru") == 0)
+        cfg.shm.evict_policy = radixshmem::EvictPolicy::LRU;
+    else {
+        fprintf(stderr, "Unknown evict policy: %s (supported: lru)\n",
+                evict_policy_str);
+        return 1;
+    }
+    cfg.shm.register_chunk_tokens = cfg.register_chunk_tokens;
+    uint32_t resolved_max_nodes = cfg.shm.effective_max_nodes();
+
+    auto fmt_size = [](uint64_t bytes) -> std::pair<double, const char*> {
+        if (bytes >= 1ULL << 40) return {bytes / (double)(1ULL << 40), "TB"};
+        if (bytes >= 1ULL << 30) return {bytes / (double)(1ULL << 30), "GB"};
+        return {bytes / (double)(1ULL << 20), "MB"};
+    };
+
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    signal(SIGPIPE, SIG_IGN);
+
+    bool distributed = cfg.expected_min_nodes > 1;
+    if (distributed) {
+        printf("Starting radix_server (distributed, node %s)...\n",
+               cfg.node_name.empty() ? "(auto node<ip>)" : cfg.node_name.c_str());
+        printf("  Registry:       %s\n", cfg.registry.c_str());
+        printf("  Min nodes:      %d\n", cfg.expected_min_nodes);
+        printf("  Cluster ID:     %s\n", cfg.cluster_id.c_str());
+        printf("  Max nodes:      %u\n", resolved_max_nodes);
+        printf("  Max blocks:     %u%s\n", cfg.shm.max_blocks,
+               cfg.shm.max_blocks ? "" : " (mempool disabled)");
+        fflush(stdout);
+    } else {
+        printf("Starting radix_server (standalone)...\n");
+        printf("  Name:           %s\n", cfg.name.c_str());
+        printf("  Max blocks:     %u%s\n", cfg.shm.max_blocks,
+               cfg.shm.max_blocks ? "" : " (mempool disabled)");
+        printf("  Block size:     %d tokens\n", cfg.shm.block_size);
+        printf("  Max nodes:      %u%s\n", resolved_max_nodes,
+               cfg.shm.max_nodes == 0 ? " (auto)" : "");
+        printf("  Register chunk: %d tokens (%d blocks)\n", cfg.register_chunk_tokens,
+               cfg.shm.effective_register_chunk_size());
+        auto layout = radixshmem::RadixShmemTree::compute_layout(cfg.shm);
+        auto [dp_v, dp_u] = fmt_size(layout.data_pool_size);
+        printf("  Data pool:      %.2f %s\n", dp_v, dp_u);
+        printf("  BG evict ratio: %.2f%s\n", cfg.shm.background_evict_ratio,
+               cfg.shm.background_evict_ratio <= 0 ? " (disabled)" : "");
+        printf("  Evict policy:   %s\n", evict_policy_str);
+        printf("\n");
+    }
+
+    radixshmem::RadixServer srv(cfg);
+    try {
+        if (!srv.bootstrap()) {
+            fprintf(stderr, "RadixServer bootstrap failed\n");
+            return 1;
+        }
+    } catch (const std::exception& e) {
+        fprintf(stderr, "RadixServer bootstrap failed: %s\n", e.what());
+        return 1;
+    }
+
+    if (distributed) {
+        printf("Cluster ready. rank=%d/%d  shm=%s\n",
+               srv.rank(), srv.world_size(), srv.shm_name().c_str());
+    } else {
+        printf("Server ready. PID=%d  shm=%s\n",
+               (int)getpid(), srv.shm_name().c_str());
+    }
+    printf("Press Ctrl+C to shutdown.\n\n");
+    fflush(stdout);
+
+    while (g_running)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    printf("\nShutting down %s...\n",
+           distributed ? "cluster node" : "server");
+    return 0;
+}

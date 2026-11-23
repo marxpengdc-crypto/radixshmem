@@ -1,0 +1,258 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""radix-server: run a RadixServer until SIGINT / SIGTERM.
+
+The server starts with what the operator knows (identity, cluster, NICs, the
+SlotStore budget and how it is split between the pools) and waits for a client
+to bring the geometry, tokens per block and bytes per slot:
+``radixshmem.RadixClient(name, radixshmem.Geometry(...))``. In a cluster the first
+node configured spreads its geometry to the others through etcd.
+
+Index only (no data plane; slot ids belong to the client's own storage, whose
+geometry brings the slot counts):
+    radix-server --name /kv
+
+Index + data plane (--data-bytes selects it; the server owns a SlotStore and
+sizes the pools from the budget: SWA and Mamba take their ratio, FULL the rest):
+    radix-server --name /kv --data-bytes 64G
+    radix-server --name /kv --data-bytes 64G --swa-ratio 0.15 --mamba-ratio 0.05
+
+Distributed (one per node, discovery via etcd, rank assigned by etcd):
+    radix-server --name /kv --data-bytes 64G --expected-min-nodes 3 \\
+                 --registry etcd://10.0.0.1:2379 --rpc-address 10.0.0.2 \\
+                 --transfer-dev mlx5_0,mlx5_1
+
+Byte sizes are the client's business; budgets and ratios may differ per node,
+the slot shape may not (the servers cross-check it through etcd).
+"""
+
+from __future__ import annotations
+
+import argparse
+import signal
+import sys
+import threading
+
+from radixshmem import _geometry
+from radixshmem.server import ClusterConfig, RadixServer, ServerConfig
+
+_SIZE = {"": 1, "B": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+
+# argparse dest -> (ServerConfig field, flag). All default to None so that a
+# flag given without --data-bytes can be reported instead of ignored.
+_DATA_FLAGS = {
+    "swa_ratio": ("swa_ratio", "--swa-ratio"),
+    "mamba_ratio": ("mamba_ratio", "--mamba-ratio"),
+    "slot_align": ("slot_align", "--slot-align"),
+    "data_name": ("data_name", "--data-name"),
+    "no_prefault": ("prefault", "--no-prefault"),
+    "transfer_backend": ("transfer_backend", "--transfer-backend"),
+    "transfer_protocol": ("transfer_protocol", "--transfer-protocol"),
+    "transfer_dev": ("transfer_devices", "--transfer-dev"),
+    "transfer_ip": ("transfer_ip", "--transfer-ip"),
+    "transfer_port": ("transfer_port", "--transfer-port"),
+    "transfer_metadata": ("transfer_metadata", "--transfer-metadata"),
+    "max_inflight": ("max_inflight", "--max-inflight"),
+    "max_pending_jobs": ("max_pending_jobs", "--max-pending-jobs"),
+    "job_ttl": ("job_ttl_s", "--job-ttl"),
+}
+
+
+def parse_size(text: str) -> int:
+    """'64G', '512M', '1073741824' -> bytes (binary units)."""
+    t = str(text).strip().upper()
+    for suffix in ("IB", "B", "I"):
+        if t.endswith(suffix) and len(t) > len(suffix):
+            t = t[:-len(suffix)]
+    unit = t[-1] if t and t[-1] in "KMGT" else ""
+    try:
+        return int(float(t[:-1] if unit else t) * _SIZE[unit])
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"bad size {text!r}") from e
+
+
+def fmt_size(nbytes: int) -> str:
+    for shift, unit in ((40, "TB"), (30, "GB")):
+        if nbytes >= 1 << shift:
+            return f"{nbytes / (1 << shift):.2f} {unit}"
+    return f"{nbytes / (1 << 20):.2f} MB"
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="radix-server", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    g = p.add_argument_group("index (both modes)")
+    g.add_argument("--name", default="/radixshmem", help="shm name / prefix (default: /radixshmem)")
+    g.add_argument("--max-nodes", type=int, default=0, help="radix node pool capacity, 0 = auto")
+    g.add_argument("--register-chunk-tokens", type=int, default=4096,
+                   help="RHT registration granularity in tokens unless the client's geometry "
+                        "brings its own (default: 4096)")
+    g.add_argument("--background-evict-ratio", type=float, default=0.05)
+    g.add_argument("--data-pool-ratio", type=float, default=4.0,
+                   help="index DataPool = full slots x ratio x bytes per block (default: 4.0)")
+    g.add_argument("--evict-policy", default="lru", choices=["lru"])
+    g.add_argument("--hugepage-path", default="",
+                   help="hugetlbfs mount for the index and the slot store (default: plain /dev/shm)")
+
+    g = p.add_argument_group("data plane (--data-bytes selects the mode; the others need it)")
+    g.add_argument("--data-bytes", type=parse_size, default=None,
+                   help="slot store budget, e.g. 64G; absent = index only")
+    g.add_argument("--swa-ratio", type=float, default=None,
+                   help="share of the budget for SWA slots when the model has SWA layers (default: 0)")
+    g.add_argument("--mamba-ratio", type=float, default=None,
+                   help="share of the budget for Mamba checkpoint slots (default: 0); "
+                        "FULL slots fill what the aux pools leave")
+    g.add_argument("--slot-align", type=int, default=None,
+                   help="slot stride alignment unless the geometry brings its own (default: 4096)")
+    g.add_argument("--data-name", default=None, help="SlotStore shm name (default: <name>_data)")
+    g.add_argument("--no-prefault", action="store_const", const=True, default=None,
+                   help="do not touch every slot page at creation")
+    g.add_argument("--transfer-backend", default=None, choices=["mooncake", "nixl"],
+                   help="(default: mooncake)")
+    g.add_argument("--transfer-protocol", default=None, choices=["rdma", "tcp"], help="(default: rdma)")
+    g.add_argument("--transfer-dev", action="append", default=None,
+                   help="HCA allowlist of the transfer engine, repeatable or comma-separated (default: all)")
+    g.add_argument("--transfer-ip", default=None, help="data-plane IP (default: the rpc address)")
+    g.add_argument("--transfer-port", type=int, default=None,
+                   help="(default: 0 = engine picks)")
+    g.add_argument("--transfer-metadata", default=None, help="(default: P2PHANDSHAKE)")
+    g.add_argument("--max-inflight", type=int, default=None,
+                   help="batches in flight at the engine (default: 1024)")
+    g.add_argument("--max-pending-jobs", type=int, default=None,
+                   help="queued + running + uncollected jobs before Submit is refused (default: 4096)")
+    g.add_argument("--job-ttl", type=float, default=None,
+                   help="seconds an uncollected job is kept (default: 300)")
+
+    g = p.add_argument_group("server")
+    g.add_argument("--endpoint", default="",
+                   help="gRPC endpoint clients connect to (default: unix:///dev/shm/<name>.sock)")
+    g.add_argument("--decode", action="store_true",
+                   help="PD disaggregation: this node serves decode (default: prefill)")
+    g.add_argument("--monitor-port", type=int, default=0,
+                   help="serve Prometheus /metrics (with the radix tree for the Grafana dashboard) "
+                        "on this port, or the next free one; 0 = off (default: 0, suggested: 9810)")
+    g.add_argument("--monitor-interval", type=float, default=10.0,
+                   help="seconds between tree copies for /metrics (default: 10)")
+    g.add_argument("--monitor-tree-nodes", type=int, default=150,
+                   help="nodes of this server's tree exported, 0 = none (default: 150)")
+    g.add_argument("--monitor-cluster-nodes", type=int, default=300,
+                   help="nodes of the merged cluster tree the leader exports, 0 = none (default: 300)")
+    g.add_argument("--transfer-log", default="-",
+                   help="one line per transfer that moved data (time, bytes, bandwidth): '-' = stdout, "
+                        "a path appends there, '' = off (default: -)")
+
+    g = p.add_argument_group("write-back of background-evicted KV")
+    g.add_argument("--writeback-max-held", type=float, default=0.05,
+                   help="background eviction pauses while unfinished write-backs cover this "
+                        "share of a pool (default: 0.05)")
+
+    g = p.add_argument_group("distributed (--expected-min-nodes > 1; the RHT is configured with "
+                             "RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_*, the peer index with "
+                             "RADIXSHMEM_PEER_INDEX_*, the RDMA device of either with "
+                             "RADIXSHMEM_INDEX_DEV / _GID_IDX, see docs/api.md)")
+    g.add_argument("--expected-min-nodes", type=int, default=0)
+    g.add_argument("--settle-ms", type=int, default=500)
+    g.add_argument("--registry", default="etcd://127.0.0.1:2379")
+    g.add_argument("--cluster-id", default="default")
+    g.add_argument("--node-name", default="")
+    g.add_argument("--rpc-address", default="", help="bootstrap IP peers dial; 0.0.0.0 on one host")
+    g.add_argument("--rpc-interface", default="", help="NIC to resolve the bootstrap IP from")
+    g.add_argument("--rpc-port", type=int, default=0,
+                   help="port of the gRPC endpoint peers reach: remote ops, peer queries, "
+                        "RDMA connection setup (default: 0 = OS-assigned)")
+    g.add_argument("--bootstrap-timeout", type=int, default=60)
+    g.add_argument("--lease-ttl", type=int, default=30,
+                   help="etcd lease TTL: how long a killed node's keys outlive it")
+    return p.parse_args(argv)
+
+
+def build_config(a: argparse.Namespace) -> ServerConfig:
+    """ValueError on a flag combination that does not describe one server."""
+    given = {dest: getattr(a, dest) for dest in _DATA_FLAGS if getattr(a, dest) is not None}
+    if a.data_bytes is None and given:
+        flags = ", ".join(_DATA_FLAGS[d][1] for d in given)
+        raise ValueError(f"{flags} need --data-bytes; without it the server is index only")
+    kw = {_DATA_FLAGS[d][0]: v for d, v in given.items()}
+    if "prefault" in kw:
+        kw["prefault"] = not kw["prefault"]
+    if "transfer_devices" in kw:
+        kw["transfer_devices"] = [d.strip() for v in kw["transfer_devices"] for d in v.split(",") if d.strip()]
+    cluster = ClusterConfig(
+        expected_min_nodes=a.expected_min_nodes, settle_ms=a.settle_ms, registry=a.registry,
+        cluster_id=a.cluster_id, node_name=a.node_name, rpc_address=a.rpc_address,
+        rpc_interface=a.rpc_interface, rpc_port=a.rpc_port,
+        bootstrap_timeout_sec=a.bootstrap_timeout, lease_ttl_sec=a.lease_ttl)
+    return ServerConfig(
+        name=a.name, data_bytes=a.data_bytes or 0, hugepage_path=a.hugepage_path,
+        max_nodes=a.max_nodes, register_chunk_tokens=a.register_chunk_tokens,
+        background_evict_ratio=a.background_evict_ratio, data_pool_ratio=a.data_pool_ratio,
+        evict_policy=a.evict_policy, endpoint=a.endpoint,
+        transfer_log=a.transfer_log, role="decode" if a.decode else "prefill",
+        monitor_port=a.monitor_port, monitor_interval_s=a.monitor_interval,
+        monitor_tree_nodes=a.monitor_tree_nodes, monitor_cluster_nodes=a.monitor_cluster_nodes,
+        writeback_max_held_ratio=a.writeback_max_held,
+        cluster=cluster, **kw)
+
+
+def _ready_banner(srv: RadixServer) -> str:
+    idx = srv.index
+    if idx.is_distributed():
+        return f"Cluster ready.  rank={idx.rank()}/{idx.world_size()}  shm={idx.shm_name()}"
+    return f"Server ready.  shm={idx.shm_name()}"
+
+
+def main(argv=None) -> None:
+    a = parse_args(argv)
+    try:
+        cfg = build_config(a)
+    except (ValueError, TypeError) as e:
+        sys.exit(f"ERROR: {e}")
+    stop = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+
+    srv = RadixServer(cfg)
+    print(f"Starting radix-server ({'index only' if cfg.index_only else 'index + data plane'})")
+    print(f"  Name:           {cfg.name}")
+    print(f"  Endpoint:       {cfg.resolved_endpoint}")
+    print(f"  Role:           {cfg.role}")
+    if srv.writeback_handler is not None:
+        print(f"  Write-back:     {type(srv.writeback_handler).__name__}  (pause at "
+              f"{cfg.writeback_max_held_ratio:g} of a pool in flight)")
+    if not cfg.index_only:
+        print(f"  Data name:      {cfg.resolved_data_name}")
+        print(f"  Data budget:    {fmt_size(cfg.data_bytes)}  (swa {cfg.swa_ratio:g}, "
+              f"mamba {cfg.mamba_ratio:g}, FULL the rest)")
+    if cfg.distributed:
+        print(f"  Registry:       {cfg.cluster.registry}  cluster {cfg.cluster.cluster_id}")
+    sys.stdout.flush()
+    try:
+        srv.start()
+    except Exception as e:  # noqa: BLE001
+        srv.close()
+        sys.exit(f"Start FAILED: {e}")
+    if srv.monitor is not None:
+        print(f"  Monitor:        {srv.monitor.url}/metrics  (Prometheus service discovery: {srv.monitor.url}/sd)")
+    print("Waiting for a client's geometry (RadixClient(name, Geometry(...))) ...", flush=True)
+    seen = srv.mode
+    try:
+        while not stop.wait(0.2):
+            mode = srv.mode
+            if mode != seen:
+                seen = mode
+                if mode == "configuring":
+                    print(f"Configuring: block {srv.geometry['block_size']} tokens, "
+                          f"{_geometry.describe(srv.geometry)}", flush=True)
+                elif mode == "ready":
+                    print(_ready_banner(srv), flush=True)
+                elif mode == "waiting":
+                    print(f"Configuration FAILED: {srv.last_error}\nWaiting for a client's geometry ...",
+                          flush=True)
+    finally:
+        print("\nShutting down ...", flush=True)
+        srv.close()
+
+
+if __name__ == "__main__":
+    main()
